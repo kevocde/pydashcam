@@ -1,86 +1,69 @@
+import av
 from datetime import datetime
 from collections import deque
-import cv2, os
 
-# Recording config
-FPS = 30
-BUFFER_SIZE = 60 * 5 # Seconds
-PRE_COLLISION_TIME = 30 # Seconds
-POS_COLLISION_TIME = 60 # Seconds
-
-# Streaming service
-streaming_url = "https://192.168.1.10:8080/video"
-cap = cv2.VideoCapture(streaming_url)
-frame_counter = 0
-
-# Streaming properties
-streaming = {
-    "fourcc": cv2.VideoWriter_fourcc(*"mp4v"),
-    "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-    "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-}
-
-# Local properties
-buffer = deque(maxlen=(FPS * BUFFER_SIZE))
-
-def save_collision_video(pre_buffer, buffer, time):
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    filename = f"output/dashcam_{timestamp}.mp4"
-    out = cv2.VideoWriter(
-        filename,
-        streaming["fourcc"],
-        FPS,
-        (streaming["width"], streaming["height"])
-    )
-
-    for frame in pre_buffer:
-        out.write(frame)
-
-    for frame in buffer:
-        out.write(frame)
-
-    out.release()
-
+from common.utils import get_arg
 from collision_detector import CollisionDetector
 
-collision_detector = CollisionDetector(FPS, PRE_COLLISION_TIME, POS_COLLISION_TIME, save_collision_video)
+# Stream props
+BUFFER_SIZE = 60 # In seconds
+STREAM_PROPS = {
+    "url": get_arg("stream"),
+    "codec": "libx264",
+    "rate": 30,
+    "dimensions": {
+        "width": 1920,
+        "height": 1080,
+    },
+}
+in_container = av.open(STREAM_PROPS["url"], options={"rtsp_transport": "tcp"})
+in_stream = in_container.streams.video[0]
+buffer = deque(maxlen=STREAM_PROPS["rate"] * BUFFER_SIZE)
+frames = 0
 
-# Process
+def save_in_file(buffer, pos_buffer, stream, time):
+    print("Collision Detected, saving evidence.")
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    filename = f"output/dashcam_{timestamp}.mkv"
+
+    out_container = av.open(filename, mode="w")
+    out_stream = out_container.add_stream_from_template(stream)
+
+    try:
+        found_kframe = False
+        for packet in buffer:
+            if packet.pts is None or packet.dts is None: continue
+            if found_kframe or packet.is_keyframe:
+                found_kframe = True
+                packet.stream = out_stream
+                out_container.mux(packet)
+
+        for packet in pos_buffer:
+            if packet.pts is None or packet.dts is None: continue
+            packet.stream = out_stream
+            out_container.mux(packet)
+    except Exception:
+        print("Error in packet ...")
+    finally:
+        out_container.close()
+
+collision_detector = CollisionDetector(int(STREAM_PROPS["rate"]), 30, 30, save_in_file)
+
 try:
-    print("Server started")
+    print("Trying to connect ...")
+    for packet in in_container.demux(in_stream):
+        if packet.dts is None: continue
 
-    while True:
-        ret, frame = cap.read()
+        buffer.append(packet)
+        frames += 1
 
-        if not ret:
-            print("Reconnecting ...")
-            cap.release()
-            cap.cv2.VideoCapture(streaming_url)
-            continue
+        collision_detector.handle(buffer, in_stream)
 
-        collision_detector.handle(buffer)
-
-
-        #collision, collision_buffer, collision_frame, collision_time = collision_detector(realtime_buffer, collision, collision_buffer, collision_frame, collision_time)
-
-        #if collision:
-        #    pre_buffer = realtime_buffer.copy()
-        #    realtime_buffer.clear()
-        #    collision = False
-        #
-        #if len(pre_buffer) > 0:
-        #    if len(realtime_buffer) >= (POS_COLLISION_TIME * FPS):
-        #        save_collision_video(pre_buffer, realtime_buffer, datetime.now())
-        #        break
-        if len(buffer) >= (FPS * BUFFER_SIZE):
-            buffer.popleft()
-        else:
-            buffer.append(frame.copy())
-
-        frame_counter += 1
+        if frames % 30 == 0:
+            print(f"Buffering ... {frames / 30} seconds")
 
 except KeyboardInterrupt:
     pass
 finally:
-    cap.release()
-    cv2.destroyAllWindows()
+    in_container.close()
+    print("Buffering stopped")
