@@ -1,69 +1,69 @@
 import av
 from datetime import datetime
 from collections import deque
-
 from common.utils import get_arg
 from collision_detector import CollisionDetector
 
-# Stream props
-BUFFER_SIZE = 60 # In seconds
-STREAM_PROPS = {
-    "url": get_arg("stream"),
-    "codec": "libx264",
-    "rate": 30,
-    "dimensions": {
-        "width": 1920,
-        "height": 1080,
-    },
-}
-in_container = av.open(STREAM_PROPS["url"], options={"rtsp_transport": "tcp"})
-in_stream = in_container.streams.video[0]
-buffer = deque(maxlen=STREAM_PROPS["rate"] * BUFFER_SIZE)
-frames = 0
+# def save_in_file(buffer, pos_buffer, stream, time):
+#     print("Collision Detected, saving evidence.")
+#     timestamp = time.strftime("%Y%m%d_%H%M%S")
+#     filename = f"output/dashcam_{timestamp}.mkv"
+#     out_container = av.open(filename, mode="w")
+#     out_stream = out_container.add_stream_from_template(stream)
+#     all_frames = list(buffer) + list(pos_buffer)
+#     found_kframe = False
+#
+#     try:
+#         for packet in all_frames[:-2]:
+#             if packet.is_corrupt:
+#                 continue
+#             else:
+#                 if found_kframe or packet.is_keyframe:
+#                     found_kframe = True
+#                     packet.stream = out_stream
+#                     out_container.mux(packet)
+#     except Exception:
+#         pass
+#     finally:
+#         out_container.close()
 
-def save_in_file(buffer, pos_buffer, stream, time):
-    print("Collision Detected, saving evidence.")
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    filename = f"output/dashcam_{timestamp}.mkv"
+#collision_detector = CollisionDetector(int(STREAM_PROPS["rate"]), 30, 30, save_in_file)
 
-    out_container = av.open(filename, mode="w")
-    out_stream = out_container.add_stream_from_template(stream)
+def start(stream_url: str, buffer_duration: int = 60, handlers: dict = {}):
+    container = av.open(stream_url, options={"rtsp_transport": "tcp"})
+    stream = container.streams.video[0]
+    rate = int(stream.base_rate)
+    buffer = deque(maxlen=(buffer_duration * rate))
+    frames = 0
 
     try:
-        found_kframe = False
-        for packet in buffer:
-            if packet.pts is None or packet.dts is None: continue
-            if found_kframe or packet.is_keyframe:
-                found_kframe = True
-                packet.stream = out_stream
-                out_container.mux(packet)
+        print("Monitoring ...")
+        for packet in container.demux(stream):
+            if packet.is_corrupt:
+                continue
 
-        for packet in pos_buffer:
-            if packet.pts is None or packet.dts is None: continue
-            packet.stream = out_stream
-            out_container.mux(packet)
-    except Exception:
-        print("Error in packet ...")
+            buffer.append(packet)
+            frames += 1
+
+            for value in handlers.values():
+                value.handle(stream, buffer)
+
+            if frames % rate == 0:
+                print(str((frames / rate)) + " secs")
+
+    except KeyboardInterrupt:
+        print("\nStopped.")
     finally:
-        out_container.close()
+        for value in handlers.values():
+            value.destroy()
 
-collision_detector = CollisionDetector(int(STREAM_PROPS["rate"]), 30, 30, save_in_file)
+        container.close()
 
-try:
-    print("Trying to connect ...")
-    for packet in in_container.demux(in_stream):
-        if packet.dts is None: continue
-
-        buffer.append(packet)
-        frames += 1
-
-        collision_detector.handle(buffer, in_stream)
-
-        if frames % 30 == 0:
-            print(f"Buffering ... {frames / 30} seconds")
-
-except KeyboardInterrupt:
-    pass
-finally:
-    in_container.close()
-    print("Buffering stopped")
+if __name__ == "__main__":
+    start(
+        get_arg("stream"),
+        60,
+        {
+            "collision": CollisionDetector()
+        }
+    )
